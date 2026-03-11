@@ -1,6 +1,7 @@
 mod log;
 mod persistent;
 mod simple;
+mod static_files;
 
 use clap::Parser;
 use std::collections::HashMap;
@@ -14,6 +15,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use log::{log, log_error};
 use persistent::{handle_persist_connection, ClientRegistry};
 use simple::handle_simple_connection;
+use static_files::serve_static;
 
 #[derive(Parser)]
 #[command(name = "stdio-to-ws", about = "Bridge stdio processes to WebSocket connections")]
@@ -45,6 +47,10 @@ struct Cli {
     /// Bind address
     #[arg(short, long, default_value = "0.0.0.0")]
     bind: String,
+
+    /// Serve static files from this directory (WebSocket moves to /ws)
+    #[arg(long)]
+    serve_dir: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -89,6 +95,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.grace_period * 1000
     };
 
+    // Resolve serve_dir to canonical path at startup
+    let serve_dir: Option<Arc<String>> = match cli.serve_dir {
+        Some(dir) => {
+            let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|e| {
+                eprintln!("Cannot resolve --serve-dir '{}': {}", dir, e);
+                std::process::exit(1);
+            });
+            let dir_str = canonical.to_string_lossy().to_string();
+            log(
+                &format!(
+                    "Serving static files from {} (WebSocket at /ws)",
+                    dir_str
+                ),
+                quiet,
+            );
+            Some(Arc::new(dir_str))
+        }
+        None => None,
+    };
+
     let clients: ClientRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     if persist {
@@ -105,16 +131,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             quiet,
         );
     } else {
-        log(&format!("WebSocket server listening on ws://{}", addr), quiet);
+        log(
+            &format!("Server listening on http://{}", addr),
+            quiet,
+        );
     }
 
     loop {
         let (stream, _peer) = listener.accept().await?;
         let command = Arc::clone(&command);
         let clients = Arc::clone(&clients);
+        let serve_dir = serve_dir.clone();
 
         tokio::spawn(async move {
-            // Extract X-Client-Id header during handshake (sync mutex for sync callback)
+            // When serve_dir is set, peek at the request to route
+            if let Some(ref dir) = serve_dir {
+                let mut peek_buf = [0u8; 2048];
+                let n = match stream.peek(&mut peek_buf).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        log_error(&format!("Peek failed: {}", e), quiet);
+                        return;
+                    }
+                };
+
+                let request_str = String::from_utf8_lossy(&peek_buf[..n]);
+                let path = request_str
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let path = path.split('?').next().unwrap_or("/");
+
+                if path != "/ws" {
+                    serve_static(stream, dir, quiet).await;
+                    return;
+                }
+            }
+
+            // WebSocket path
             let client_id_header: Arc<std::sync::Mutex<Option<String>>> =
                 Arc::new(std::sync::Mutex::new(None));
             let header_ref = Arc::clone(&client_id_header);
